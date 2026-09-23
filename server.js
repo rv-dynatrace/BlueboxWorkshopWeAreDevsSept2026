@@ -13,8 +13,10 @@ const integerEnv = (name, fallback, minimum) => {
 const databasePoolSize = integerEnv('DATABASE_POOL_SIZE', 8, 1);
 const databaseQueueLimit = integerEnv('DATABASE_QUEUE_LIMIT', 100, 0);
 const databaseQueueTimeoutMs = integerEnv('DATABASE_QUEUE_TIMEOUT_MS', 5000, 1);
+const paymentTimeoutMs = integerEnv('PAYMENT_TIMEOUT_MS', 650, 1);
 const databasePool = Array.from({ length: databasePoolSize }, () => ({}));
 const databaseWaiters = [];
+const saleProductIds = new Set(['orbit-lamp', 'signal-notebook']);
 const products = [
   { id: 'aurora-mug', name: 'Aurora Field Mug', description: 'A durable enamel mug for early starts and late ideas.', priceCents: 2400, category: 'Desk', emoji: '☕' },
   { id: 'signal-notebook', name: 'Signal Notebook', description: 'Dot-grid pages for diagrams, traces, and half-formed plans.', priceCents: 1800, category: 'Desk', emoji: '📓' },
@@ -55,7 +57,6 @@ const releaseDatabaseConnection = connection => {
 const database = async (url, options = {}) => {
   const connection = await acquireDatabaseConnection(url);
   try {
-    await new Promise(resolve => setTimeout(resolve, 250));
     const response = await fetch(`${postgrestUrl}${url}`, { ...options, headers: { accept: 'application/json', 'content-type': 'application/json', ...(options.headers || {}) } });
     const text = await response.text(); let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = { message: text }; }
     if (!response.ok) throw new Error(data?.message || data?.details || `Database request failed: ${response.status}`);
@@ -64,7 +65,12 @@ const database = async (url, options = {}) => {
     releaseDatabaseConnection(connection);
   }
 };
-const mapProduct = product => ({ ...product, priceCents: product.price_cents, price_cents: undefined });
+const mapProduct = product => {
+  const priceCents = product.price_cents;
+  const isOnSale = saleProductIds.has(product.id);
+  const salePriceCents = isOnSale ? Math.round(priceCents * 0.8) : null;
+  return { ...product, priceCents, salePriceCents, effectivePriceCents: salePriceCents ?? priceCents, isOnSale, isFeatured: isOnSale, price_cents: undefined };
+};
 const cart = userId => database(`/carts?user_id=eq.${encodeURIComponent(userId)}&select=quantity,products(*)`).then(items => items.map(item => ({ product: mapProduct(item.products), quantity: item.quantity })));
 
 async function route(req, res, url) {
@@ -81,10 +87,10 @@ async function route(req, res, url) {
   if (url.pathname === '/api/cart' && req.method === 'DELETE') { await database(`/carts?user_id=eq.${encodeURIComponent(userId)}`, { method: 'DELETE' }); return send(res, 204, null); }
   if (url.pathname === '/api/checkout' && req.method === 'POST') {
     const input = await readBody(req); const items = await cart(userId); if (!items.length) return send(res, 400, { error: 'Your cart is empty' });
-    const totalCents = items.reduce((total, item) => total + item.product.priceCents * item.quantity, 0);
+    const totalCents = items.reduce((total, item) => total + item.product.effectivePriceCents * item.quantity, 0);
     const orderId = `order_${randomUUID().slice(0, 8)}`;
     const charge = attempt => {
-      const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 150);
+      const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), paymentTimeoutMs);
       return fetch(`${paymentUrl}/charge`, { method: 'POST', signal: controller.signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ amountCents: totalCents, email: input.email, orderId, attempt, cardLast4: input.cardNumber?.slice(-4) }) }).then(response => response.json()).finally(() => clearTimeout(timeout));
     };
     let payment;
