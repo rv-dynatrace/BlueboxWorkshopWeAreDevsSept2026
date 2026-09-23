@@ -6,7 +6,15 @@ const { randomUUID } = require('node:crypto');
 const port = Number(process.env.PORT || 8088);
 const paymentUrl = process.env.PAYMENT_URL || 'http://localhost:4004';
 const postgrestUrl = process.env.POSTGREST_URL || 'http://localhost:3000';
-const databasePool = [{}, {}];
+const integerEnv = (name, fallback, minimum) => {
+  const value = Number.parseInt(process.env[name] || '', 10);
+  return Number.isInteger(value) && value >= minimum ? value : fallback;
+};
+const databasePoolSize = integerEnv('DATABASE_POOL_SIZE', 8, 1);
+const databaseQueueLimit = integerEnv('DATABASE_QUEUE_LIMIT', 100, 0);
+const databaseQueueTimeoutMs = integerEnv('DATABASE_QUEUE_TIMEOUT_MS', 5000, 1);
+const databasePool = Array.from({ length: databasePoolSize }, () => ({}));
+const databaseWaiters = [];
 const products = [
   { id: 'aurora-mug', name: 'Aurora Field Mug', description: 'A durable enamel mug for early starts and late ideas.', priceCents: 2400, category: 'Desk', emoji: '☕' },
   { id: 'signal-notebook', name: 'Signal Notebook', description: 'Dot-grid pages for diagrams, traces, and half-formed plans.', priceCents: 1800, category: 'Desk', emoji: '📓' },
@@ -18,12 +26,34 @@ const products = [
 
 const send = (res, status, value, type = 'application/json') => { res.writeHead(status, { 'content-type': type }); res.end(type === 'application/json' ? JSON.stringify(value) : value); };
 const readBody = req => new Promise((resolve, reject) => { let value = ''; req.on('data', chunk => { value += chunk; }); req.on('end', () => resolve(value ? JSON.parse(value) : {})); req.on('error', reject); });
-const database = async (url, options = {}) => {
+const acquireDatabaseConnection = url => {
   const connection = databasePool.pop();
-  if (!connection) {
-    console.error(JSON.stringify({ event: 'database_pool_exhausted', poolSize: 2, databaseUrl: url }));
-    throw new Error('database connection pool exhausted');
+  if (connection) return Promise.resolve(connection);
+  if (databaseWaiters.length >= databaseQueueLimit) {
+    console.error(JSON.stringify({ event: 'database_pool_exhausted', poolSize: databasePoolSize, queueLimit: databaseQueueLimit, databaseUrl: url }));
+    return Promise.reject(new Error('database connection pool exhausted'));
   }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject };
+    waiter.timeout = setTimeout(() => {
+      const index = databaseWaiters.indexOf(waiter);
+      if (index !== -1) databaseWaiters.splice(index, 1);
+      reject(new Error('database connection wait timed out'));
+    }, databaseQueueTimeoutMs);
+    databaseWaiters.push(waiter);
+  });
+};
+const releaseDatabaseConnection = connection => {
+  const waiter = databaseWaiters.shift();
+  if (waiter) {
+    clearTimeout(waiter.timeout);
+    waiter.resolve(connection);
+  } else {
+    databasePool.push(connection);
+  }
+};
+const database = async (url, options = {}) => {
+  const connection = await acquireDatabaseConnection(url);
   try {
     await new Promise(resolve => setTimeout(resolve, 250));
     const response = await fetch(`${postgrestUrl}${url}`, { ...options, headers: { accept: 'application/json', 'content-type': 'application/json', ...(options.headers || {}) } });
@@ -31,7 +61,7 @@ const database = async (url, options = {}) => {
     if (!response.ok) throw new Error(data?.message || data?.details || `Database request failed: ${response.status}`);
     return data;
   } finally {
-    databasePool.push(connection);
+    releaseDatabaseConnection(connection);
   }
 };
 const mapProduct = product => ({ ...product, priceCents: product.price_cents, price_cents: undefined });
